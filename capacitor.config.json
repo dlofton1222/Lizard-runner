@@ -1,0 +1,9 @@
+{
+  "appId": "com.example.lizardrunner",
+  "appName": "Lizard Runner",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  }
+}

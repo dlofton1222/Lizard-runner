@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lizard Runner</title>
+  <style>
+    :root{ --bg:linear-gradient(180deg,#ffe7a3,#ffd1f3); --fg:#111; --accent:#7b5cff; --muted:#c9c9c9; }
+    *{box-sizing:border-box}
+    body{margin:0; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--fg);}
+    header{display:flex; gap:12px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--muted); position:sticky; top:0; background:rgba(255,255,255,.6); backdrop-filter: blur(8px); z-index:2}
+    h1{font-size:18px; margin:0; font-weight:700}
+    .controls{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+    .controls > *{font-size:14px}
+    button, input[type=file]{
+      border:1px solid var(--muted); background:white; padding:6px 10px; border-radius:10px; cursor:pointer;
+    }
+    button.primary{border-color:var(--accent); box-shadow:0 4px 12px rgba(123,92,255,.2)}
+    .wrap{display:grid; place-items:center; padding:10px}
+    canvas{border:2px solid var(--muted); border-radius:16px; width:min(960px, 96vw); height:auto; touch-action:manipulation; box-shadow:0 8px 24px rgba(0,0,0,.12)}
+    .hud{margin-top:8px; display:flex; gap:16px; justify-content:center; font-variant-numeric:tabular-nums}
+    .pill{padding:4px 10px; border:1px solid var(--muted); border-radius:999px; background:white}
+    .hint{opacity:.7}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🦎 Lizard Runner</h1>
+    <div class="controls">
+      <button id="btn-start" class="primary">Start / Restart</button>
+      <button id="btn-pause">Pause</button>
+      <label class="pill"><input id="chk-audio" type="checkbox" checked> Sound on jump</label>
+      <label class="pill">Change jump sound <input id="file-audio" type="file" accept="audio/*"></label>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <canvas id="game" width="960" height="260" aria-label="Lizard Runner game" role="img"></canvas>
+    <div class="hud">
+      <div class="pill">Score: <span id="score">0</span></div>
+      <div class="pill">Best: <span id="best">0</span></div>
+      <div class="pill">Speed: <span id="speed">0.0</span>x</div>
+      <div class="pill hint">Controls: Space/↑/Tap to jump • P to pause</div>
+    </div>
+  </div>
+
+  <!-- Embedded default audio -->
+  <audio id="jump-sound" preload="auto" src="assets/jump.mp3"></audio>
+
+  <script>
+  (()=>{
+    const BASELINE_PX_PER_SEC = 520;
+    const INITIAL_SPEED_MULT = 1.0;
+    const DIFFICULTY_GROWTH = 0.025;
+    const GRAVITY = 2600;
+    const JUMP_VELOCITY = -820;
+    const GROUND_Y = 210;
+    const OBSTACLE_MIN_GAP = 260;
+    const OBSTACLE_MAX_GAP = 430;
+    const CLOUD_SPEED = 35;
+
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const scoreEl = document.getElementById('score');
+    const bestEl = document.getElementById('best');
+    const speedEl = document.getElementById('speed');
+    const btnStart = document.getElementById('btn-start');
+    const btnPause = document.getElementById('btn-pause');
+    const chkAudio = document.getElementById('chk-audio');
+    const fileAudio = document.getElementById('file-audio');
+    const jumpSound = document.getElementById('jump-sound');
+
+    let bestScore = +(localStorage.getItem('lizard-best')||0);
+    bestEl.textContent = bestScore;
+
+    let rng = mulberry32(Date.now()>>>0);
+
+    let running = false, paused = false, gameOver = false;
+    let speedMult = INITIAL_SPEED_MULT;
+    let pxPerSec = BASELINE_PX_PER_SEC * speedMult;
+    let last = 0;
+    let elapsed = 0;
+    let score = 0;
+
+    const player = { x:80, y:GROUND_Y, w:42, h:36, vy:0, grounded:true, t:0 };
+    const obstacles = [];
+    let nextObstacleIn = 0;
+
+    const clouds = makeClouds();
+
+    function reset(){
+      running = true; paused = false; gameOver = false;
+      speedMult = INITIAL_SPEED_MULT;
+      pxPerSec = BASELINE_PX_PER_SEC * speedMult;
+      last = 0; elapsed = 0; score = 0;
+      player.y = GROUND_Y; player.vy = 0; player.grounded = true; player.t = 0;
+      obstacles.length = 0;
+      nextObstacleIn = scaleGap(rand(OBSTACLE_MIN_GAP, OBSTACLE_MAX_GAP));
+      for(const c of clouds){ c.x = rand(0, canvas.width); c.y = rand(20, 120);}    
+      draw(0); updateHud();
+    }
+
+    function updateHud(){
+      scoreEl.textContent = Math.floor(score);
+      speedEl.textContent = speedMult.toFixed(2);
+      bestEl.textContent = bestScore;
+    }
+
+    function spawnObstacle(){
+      const segments = Math.round(rand(1,3));
+      const width = 16 * segments + rand(0, 10);
+      const height = rand(30, 70 + segments*8);
+      const y = GROUND_Y - height + 6;
+      obstacles.push({ x:canvas.width + 10, y, w:width, h:height, passed:false });
+      nextObstacleIn = scaleGap(rand(OBSTACLE_MIN_GAP, OBSTACLE_MAX_GAP));
+    }
+
+    function scaleGap(px){ return px / Math.sqrt(speedMult); }
+
+    function update(dt){
+      if(!running || paused) return;
+      elapsed += dt;
+
+      speedMult = INITIAL_SPEED_MULT * (1 + DIFFICULTY_GROWTH * (elapsed/10));
+      pxPerSec = BASELINE_PX_PER_SEC * speedMult;
+
+      for(const c of clouds){ c.x -= CLOUD_SPEED * dt; if(c.x < -120) { c.x = canvas.width + rand(0, 300); c.y = rand(20, 120);} }
+
+      player.vy += GRAVITY * dt;
+      player.y += player.vy * dt;
+      if(player.y >= GROUND_Y){ player.y = GROUND_Y; player.vy = 0; player.grounded = true; }
+      player.t += dt;
+
+      const dx = pxPerSec * dt;
+      nextObstacleIn -= dx;
+      if(nextObstacleIn <= 0) spawnObstacle();
+      for(let i=obstacles.length-1;i>=0;i--){
+        const o = obstacles[i];
+        o.x -= dx;
+        if(o.x + o.w < 0) obstacles.splice(i,1);
+        else if(!o.passed && o.x + o.w < player.x){ o.passed = true; score += 10 * speedMult; }
+      }
+
+      for(const o of obstacles){
+        if (rectsOverlap(player.x, player.y-player.h, player.w, player.h, o.x, o.y, o.w, o.h)) {
+          die(); break;
+        }
+      }
+
+      updateHud();
+    }
+
+    function die(){
+      gameOver = true; running = false; paused = false;
+      bestScore = Math.max(bestScore, Math.floor(score));
+      localStorage.setItem('lizard-best', bestScore);
+    }
+
+    function draw(){
+      // Colorful sky gradient
+      const g = ctx.createLinearGradient(0,0,0,canvas.height);
+      g.addColorStop(0, '#a0d8ff');
+      g.addColorStop(1, '#fff1ff');
+      ctx.fillStyle = g; ctx.fillRect(0,0,canvas.width,canvas.height);
+
+      // Ground line
+      ctx.strokeStyle = '#8c6a43'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(0,GROUND_Y+8); ctx.lineTo(canvas.width, GROUND_Y+8); ctx.stroke();
+
+      // Clouds
+      for(const c of clouds){ drawCloud(c.x, c.y, 30 + c.scale*20); }
+
+      // Obstacles with shifting hue by elapsed time
+      const hue = (elapsed*20)%360;
+      ctx.fillStyle = `hsl(${hue},55%,35%)`;
+      for(const o of obstacles){ ctx.fillRect(o.x, o.y, o.w, o.h); }
+
+      // Player
+      drawLizard(player.x, player.y, player.w, player.h, player.grounded ? 0 : 1);
+
+      // Score text
+      ctx.font = '16px system-ui,Segoe UI,Roboto,Arial';
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#000'; ctx.globalAlpha = 0.12; ctx.fillText(Math.floor(score), canvas.width-11, 24);
+      ctx.globalAlpha = 1; ctx.fillStyle = '#333'; ctx.fillText(Math.floor(score), canvas.width-12, 22);
+
+      if(gameOver){
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 22px system-ui,Segoe UI,Roboto,Arial';
+        ctx.fillStyle = '#111';
+        ctx.fillText('Game Over — Press Start to try again', canvas.width/2, canvas.height/2 - 6);
+      }
+    }
+
+    function loop(ts){
+      if(!last) last = ts;
+      const dt = Math.min(0.05, (ts - last) / 1000);
+      last = ts;
+      update(dt);
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    function drawCloud(x,y,r){
+      ctx.fillStyle = '#eaeaea';
+      ctx.beginPath();
+      ctx.arc(x, y, r*0.6, 0, Math.PI*2);
+      ctx.arc(x+r*0.5, y+2, r*0.75, 0, Math.PI*2);
+      ctx.arc(x-r*0.5, y+8, r*0.5, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    function drawLizard(x, groundY, w, h, airborne){
+      const y = groundY - h;
+      ctx.save();
+      ctx.fillStyle = '#2ea043';
+      roundRect(x, y+4, w, h-4, 6, true);
+      ctx.beginPath();
+      ctx.moveTo(x+4, y+h*0.4);
+      ctx.quadraticCurveTo(x-18, y+h*0.35, x-26, y+h*0.5);
+      ctx.quadraticCurveTo(x-8, y+h*0.65, x+6, y+h*0.55);
+      ctx.fill();
+      ctx.fillStyle = '#111';
+      ctx.beginPath(); ctx.arc(x+w-10, y+10, 3, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = '#185a27'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+      const t = player.t * 12;
+      const swing = (airborne? 0.3 : 1) * Math.sin(t);
+      ctx.beginPath(); ctx.moveTo(x+w*0.7, groundY-4); ctx.lineTo(x+w*0.7 + 10*swing, groundY+8); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x+w*0.35, groundY-4); ctx.lineTo(x+w*0.35 - 10*swing, groundY+8); ctx.stroke();
+      ctx.restore();
+    }
+
+    function roundRect(x,y,w,h,r,fill){
+      ctx.beginPath();
+      ctx.moveTo(x+r, y);
+      ctx.arcTo(x+w, y, x+w, y+h, r);
+      ctx.arcTo(x+w, y+h, x, y+h, r);
+      ctx.arcTo(x, y+h, x, y, r);
+      ctx.arcTo(x, y, x+w, y, r);
+      if(fill) ctx.fill();
+    }
+
+    function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh){
+      return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+    }
+
+    function makeClouds(){
+      const arr = [];
+      for(let i=0;i<5;i++) arr.push({x:rand(0, canvas.width), y:rand(20, 120), scale:rand(0.5,1)});
+      return arr;
+    }
+
+    function jump(){
+      if(!running || paused) return;
+      if(player.grounded){
+        player.vy = JUMP_VELOCITY; player.grounded = false; player.t += 0.12;
+        if(chkAudio.checked){ try{ jumpSound.currentTime = 0; jumpSound.play(); }catch(e){} }
+      }
+    }
+
+    document.addEventListener('keydown', e=>{
+      if(e.code === 'Space' || e.code === 'ArrowUp'){ e.preventDefault(); jump(); }
+      if(e.key && e.key.toLowerCase() === 'p'){ togglePause(); }
+    });
+    canvas.addEventListener('pointerdown', jump);
+
+    btnStart.addEventListener('click', ()=> reset());
+    btnPause.addEventListener('click', ()=> togglePause());
+    function togglePause(){ if(!running) return; paused = !paused; }
+
+    fileAudio.addEventListener('change', ()=>{
+      const f = fileAudio.files && fileAudio.files[0];
+      if(!f) return;
+      const url = URL.createObjectURL(f);
+      jumpSound.src = url; jumpSound.load();
+    });
+
+    function rand(min,max){ return min + (max-min) * rng(); }
+    function mulberry32(a){ return function(){ let t = a += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; } }
+
+    reset();
+    requestAnimationFrame(loop);
+  })();
+  </script>
+</body>
+</html>
